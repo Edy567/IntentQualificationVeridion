@@ -1,3 +1,5 @@
 flask 
 requests 
 streamlit
+rank_bm25 
+sentence-transformers

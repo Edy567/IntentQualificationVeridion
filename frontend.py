@@ -14,7 +14,7 @@ query = st.text_input("Ce fel de companii cauți?",
 
 if st.button("Caută Companii", type="primary"):
     if query:
-        with st.spinner("Analizez fiecare companie din baza de date... (Asta va dura ceva)"):
+        with st.spinner("Analizez fiecare companie din baza de date... "):
             try:
                 response = requests.post(BACKEND_URL, json={"query": query})
                 
