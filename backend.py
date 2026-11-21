@@ -1,4 +1,3 @@
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import logging
@@ -10,31 +9,32 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Flask, jsonify, request
+from google import genai
+from google.genai import types
 import numpy as np
 from rank_bm25 import BM25Okapi
-import requests
 from sentence_transformers import SentenceTransformer, util
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# --- Configuration ---
 DATA_PATH = Path(__file__).resolve().parent / "companies.jsonl"
 CACHE_DIR = Path(__file__).resolve().parent / ".index_cache"
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
-MODEL_NAME = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
 INDEX_SCHEMA_VERSION = "v2"
 
-RETRIEVAL_POOL_N = 50  # Candidates pulled per retrieval engine (BM25, Vector)
-RERANK_TOP_K = 10      
-MAX_WORKERS = 1         
-OLLAMA_TIMEOUT = 120
+RETRIEVAL_POOL_N = 50
+RERANK_TOP_K = 10
+
+gemini_client = genai.Client(http_options=types.HttpOptions(api_version="v1beta"))
 
 REGION_COUNTRIES = {
     "europe": {
@@ -46,7 +46,6 @@ REGION_COUNTRIES = {
     "scandinavia": {"sweden", "norway", "denmark", "finland", "iceland"},
     "united states": {"united states", "usa", "u.s.", "us"},
 }
-
 
 COUNTRY_CODE = {
     "germany": "de", "france": "fr", "united kingdom": "gb", "uk": "gb",
@@ -65,7 +64,6 @@ def tokenize(text: str) -> List[str]:
 
 
 def parse_maybe_dict(value: Any) -> Dict[str, Any]:
-    """address / primary_naics may be a real dict OR a stringified python dict."""
     if isinstance(value, dict):
         return value
     if isinstance(value, str):
@@ -140,8 +138,6 @@ def file_sha256(path: Path) -> str:
 def load_and_index_companies(
     filepath: Path,
 ) -> Tuple[List[Dict[str, Any]], Optional[BM25Okapi], Optional[np.ndarray]]:
-
-
     if not filepath.exists():
         logger.warning("Data file %s not found.", filepath)
         return [], None, None
@@ -190,8 +186,6 @@ def load_and_index_companies(
 COMPANIES, BM25_INDEX, VECTOR_INDEX = load_and_index_companies(DATA_PATH)
 
 
-# ----------------- QUERY CONSTRAINT EXTRACTION -----------------
-
 def regex_fallback_constraints(query: str) -> Dict[str, Any]:
     q = query.lower()
     constraints: Dict[str, Any] = {}
@@ -220,7 +214,6 @@ def regex_fallback_constraints(query: str) -> Dict[str, Any]:
         mult = 1_000_000_000 if unit.startswith("b") else (1_000_000 if unit.startswith("m") else 1)
         constraints["min_revenue"] = int(val * mult)
 
-    # Location: match any known country name mentioned in the query.
     for name in COUNTRY_CODE:
         if re.search(rf"\b{name}\b", q):
             constraints["location"] = name
@@ -246,30 +239,28 @@ Return ONLY a valid JSON object with any applicable keys (omit or set to null if
   "is_public": <true, false, or null>
 }}
 """
-    payload = {"model": MODEL_NAME, "prompt": prompt, "stream": False, "format": "json", "options": {"num_gpu": 0, "num_ctx": 2048}}
     try:
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=30)
-        resp.raise_for_status()
-        parsed = json.loads(resp.json().get("response", "{}"))
+        resp = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json"),
+        )
+        parsed = json.loads(resp.text or "{}")
         return {k: v for k, v in parsed.items() if v is not None}
     except Exception as e:
-        logger.warning("Constraint extraction via Ollama failed (%s); using regex fallback.", e)
+        logger.warning("Constraint extraction via Gemini failed (%s); using regex fallback.", e)
         return regex_fallback_constraints(query)
 
 
 def location_matches(address: Any, target_location: str) -> bool:
-    """Match a company's address against a target location name.
-    Handles stringified-dict addresses and ISO country_code."""
     loc = target_location.lower().strip()
     addr_dict = parse_maybe_dict(address)
     cc = (addr_dict.get("country_code") or "").lower()
     region = (addr_dict.get("region_name") or "").lower()
     town = (addr_dict.get("town") or "").lower()
 
-    # direct country-code hit (Germany -> de)
     if loc in COUNTRY_CODE and cc == COUNTRY_CODE[loc]:
         return True
-    # textual hits
     haystack = " ".join([cc, region, town, str(address).lower()])
     if loc in haystack:
         return True
@@ -279,7 +270,6 @@ def location_matches(address: Any, target_location: str) -> bool:
 
 
 def compute_constraint_adjustment(company: Dict[str, Any], constraints: Dict[str, Any]) -> float:
-    """Soft boost (+0.25) for matched constraints, penalty (-0.35) for violations, 0.0 for missing data."""
     if not constraints:
         return 0.0
 
@@ -317,18 +307,6 @@ def compute_constraint_adjustment(company: Dict[str, Any], constraints: Dict[str
     return adjustment
 
 
-# ----------------- HARD PRE-FILTER (explicit structured constraints only) -----------------
-#
-# Rule (per spec):
-#   * EXPLICIT structured constraints (min/max employees, revenue, year,
-#     is_public, location) are HARD. A company is dropped if its known value
-#     violates the constraint OR the value is null/missing — the user explicitly
-#     asked for it, so "unknown" does not pass.
-#   * FUZZY / semantic intent (industry, "software companies") is NEVER filtered
-#     here (not in HARD_CONSTRAINT_KEYS). A finance company like PayPal with
-#     software-ish offerings stays retrievable; embeddings + the LLM reranker
-#     place it below the obvious software companies.
-
 HARD_CONSTRAINT_KEYS = {
     "min_employees", "max_employees",
     "min_revenue", "max_revenue",
@@ -338,9 +316,6 @@ HARD_CONSTRAINT_KEYS = {
 
 
 def passes_hard_constraints(company: Dict[str, Any], constraints: Dict[str, Any]) -> bool:
-    """True if the company survives every EXPLICIT structured constraint.
-    Missing value on a constrained field -> False (excluded)."""
-
     if "min_employees" in constraints or "max_employees" in constraints:
         emp = company.get("employee_count")
         if emp is None:
@@ -386,16 +361,12 @@ def passes_hard_constraints(company: Dict[str, Any], constraints: Dict[str, Any]
 
 
 def apply_hard_prefilter(constraints: Dict[str, Any]) -> Tuple[List[int], bool]:
-    """Return (surviving_indices over COMPANIES, filter_active).
-    No hard keys -> filter_active=False and ALL indices (pure semantic query)."""
     active = any(k in constraints for k in HARD_CONSTRAINT_KEYS)
     if not active:
         return list(range(len(COMPANIES))), False
     survivors = [i for i, c in enumerate(COMPANIES) if passes_hard_constraints(c, constraints)]
     return survivors, True
 
-
-# ----------------- STAGE 1: HYBRID RETRIEVER -----------------
 
 def hybrid_search(
     query: str,
@@ -405,13 +376,11 @@ def hybrid_search(
     if not COMPANIES or BM25_INDEX is None or VECTOR_INDEX is None:
         return []
 
-    # --- hard pre-filter on explicit structured constraints ---
     allowed_indices, filter_active = apply_hard_prefilter(constraints)
     allowed = set(allowed_indices)
     if filter_active and not allowed:
         logger.info("Hard pre-filter removed all candidates for constraints %s", constraints)
         return []
-    # -----------------------------------------------------------
 
     n_docs = len(COMPANIES)
     pool_n = min(RETRIEVAL_POOL_N, n_docs)
@@ -440,8 +409,6 @@ def hybrid_search(
     combined_scores: Dict[int, float] = {}
     for doc_idx, rrf in rrf_scores.items():
         norm_rrf = rrf / max_rrf
-        # Soft adjustment only matters when the hard filter is NOT active
-        # (semantic queries). When active, survivors already satisfy it.
         adj = 0.0 if filter_active else compute_constraint_adjustment(COMPANIES[doc_idx], constraints)
         combined_scores[doc_idx] = norm_rrf + adj
 
@@ -449,105 +416,68 @@ def hybrid_search(
     return [COMPANIES[idx] for idx, _ in sorted_indices[:final_k]]
 
 
-
-
-def parse_llm_output(raw_text: str) -> Tuple[int, str]:
-    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text.strip(), flags=re.IGNORECASE)
-
-    score_val = None
-    reasoning = ""
-
-    try:
-        parsed = json.loads(cleaned)
-        if isinstance(parsed, dict):
-            reasoning = str(parsed.get("reasoning", "")).strip()
-            raw_score = parsed.get("score")
-            if isinstance(raw_score, (int, float)):
-                score_val = round(float(raw_score))
-            elif isinstance(raw_score, str):
-                m = re.search(r"\d+(?:\.\d+)?", raw_score)
-                if m:
-                    score_val = round(float(m.group()))
-    except json.JSONDecodeError:
-        pass
-
-    if score_val is None:
-        m_score = re.search(r'"?score"?\s*[:=]\s*"?(\d+(?:\.\d+)?)"?', cleaned, re.IGNORECASE)
-        if m_score:
-            score_val = round(float(m_score.group(1)))
-        m_reason = re.search(r'"?reasoning"?\s*[:=]\s*"([^"]+)"', cleaned, re.IGNORECASE)
-        if m_reason and not reasoning:
-            reasoning = m_reason.group(1).strip()
-
-    if score_val is None:
-        raise ValueError(f"Could not extract numeric score from LLM response: {raw_text[:200]}")
-
-    return min(max(score_val, 0), 100), reasoning
-
-
-def evaluate_company_with_llm(
+def rerank_candidates(
     query: str,
-    company_data: Dict[str, Any],
+    candidates: List[Dict[str, Any]],
     constraints: Dict[str, Any],
-) -> Dict[str, Any]:
+) -> List[Dict[str, Any]]:
+    if not candidates:
+        return []
+
     constraints_block = json.dumps(constraints, indent=2) if constraints else "None explicitly detected"
+    profiles_payload = [
+        {"index": i, "profile": c} for i, c in enumerate(candidates)
+    ]
+
     prompt = f"""
-You are an expert B2B matchmaker. Evaluate how well the Company Profile matches the User Query.
+You are an expert B2B matchmaker. Evaluate how well EACH Company Profile matches the User Query.
 
 User Query: "{query}"
 
 Parsed Constraints to Verify:
 {constraints_block}
 
-Company Profile:
-{json.dumps(company_data, indent=2, default=str)}
+Companies to Evaluate:
+{json.dumps(profiles_payload, indent=2, default=str)}
 
 RULES:
-1. HARD CONSTRAINTS: Verify every parsed constraint against the Company Profile. If a known value clearly violates a constraint, score MUST be <= 25. If a field is null/missing, infer cautiously from the description and cap score at 70 unless strongly supported.
+1. HARD CONSTRAINTS: Verify every parsed constraint against each Company Profile. If a known value clearly violates a constraint, score MUST be <= 25. If a field is null/missing, infer cautiously from the description and cap score at 70 unless strongly supported.
 2. INDUSTRY & ROLE FIT: Check primary_naics, secondary_naics, core_offerings, target_markets, and description.
-   - Unrelated industry or wrong supply-chain role: 0-20
-   - Secondary/debatable match: 40-70
-   - Direct, strong match: 80-100
+  - Unrelated industry or wrong supply-chain role: 0-20
+  - Secondary/debatable match: 40-70
+  - Direct, strong match: 80-100
 
-Return ONLY valid JSON: {{"reasoning": "1-2 concise sentences", "score": <integer 0-100>}}
+Return ONLY a valid JSON array with one object per company, matching the exact "index":
+[
+  {{"index": 0, "reasoning": "1-2 concise sentences", "score": <integer 0-100>}}
+]
 """
-    payload = {"model": MODEL_NAME, "prompt": prompt, "stream": False, "format": "json"}
-    name = company_data.get("operational_name", "Unknown")
 
     try:
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=OLLAMA_TIMEOUT)
-        resp.raise_for_status()
-        raw_response = resp.json().get("response", "")
-        score, reasoning = parse_llm_output(raw_response)
-        return {
-            "company": company_data,
-            "score": score,
-            "reasoning": reasoning,
-            "status": "ok",
-            "error": None,
-        }
-    except requests.Timeout as e:
-        logger.error("Timeout evaluating '%s': %s", name, e)
-        return {"company": company_data, "score": None, "reasoning": "", "status": "error", "error": "timeout"}
+        resp = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json"),
+        )
+        raw_list = json.loads(resp.text or "[]")
+        by_idx = {int(item["index"]): item for item in raw_list if isinstance(item, dict) and "index" in item}
+
+        evaluated: List[Dict[str, Any]] = []
+        for i, company in enumerate(candidates):
+            item = by_idx.get(i)
+            if not item:
+                evaluated.append({"company": company, "score": None, "reasoning": "", "status": "error", "error": "missing_in_batch"})
+                continue
+            score = min(max(round(float(item.get("score", 0))), 0), 100)
+            reasoning = str(item.get("reasoning", "")).strip()
+            evaluated.append({"company": company, "score": score, "reasoning": reasoning, "status": "ok", "error": None})
+        return evaluated
     except Exception as e:
-        logger.error("Failed evaluating '%s': %s", name, e)
-        return {"company": company_data, "score": None, "reasoning": "", "status": "error", "error": str(e)}
-
-
-def rerank_candidates(
-    query: str,
-    candidates: List[Dict[str, Any]],
-    constraints: Dict[str, Any],
-) -> List[Dict[str, Any]]:
-    evaluated: List[Dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [
-            executor.submit(evaluate_company_with_llm, query, company, constraints)
-            for company in candidates
+        logger.error("Batch reranking via Gemini failed: %s", e)
+        return [
+            {"company": c, "score": None, "reasoning": "", "status": "error", "error": str(e)}
+            for c in candidates
         ]
-        for future in as_completed(futures):
-            evaluated.append(future.result())
-    return evaluated
 
 
 @app.route("/api/search", methods=["POST"])

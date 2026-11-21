@@ -1,10 +1,10 @@
 import streamlit as st
 import requests
 
-st.set_page_config(page_title="Company Matcher", page_icon="🏢", layout="centered")
+st.set_page_config(page_title="Company Matcher", layout="centered")
 
-st.title("🔍 Semantic Company Matcher")
-st.markdown("Căutare inteligentă bazată pe intenție (LLM Baseline).")
+st.title(" Company Matcher")
+
 
 BACKEND_URL = "http://localhost:5000/api/search"
 

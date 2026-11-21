@@ -1,3 +1,5 @@
 Notes.txt
 companies.jsonl
 .venv
+.index_cache
+.env
